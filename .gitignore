@@ -20,4 +20,4 @@ wheels/
 .ipynb_checkpoints
 config.json
 
-*.lock
+uv.lock
