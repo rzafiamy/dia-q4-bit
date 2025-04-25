@@ -38,18 +38,18 @@ device = get_torch_device(args.device)
 print(f"[INFO] Using device: {device}")
 
 
-# ----------------------------
-# Load Nari Model
-# ----------------------------
-print("[INFO] Loading Nari model...")
-try:
-    model = Dia.from_pretrained(
-        "nari-labs/Dia-1.6B",
-        compute_dtype="float16",
-        quantize_4bit=True
-    )
-except Exception as e:
-    raise RuntimeError(f"[ERROR] Failed to load model: {e}") from e
+_model = None
+
+def get_model():
+    global _model
+    if _model is None:
+        print("[INFO] Loading Nari model...")
+        _model = Dia.from_pretrained(
+            "nari-labs/Dia-1.6B",
+            compute_dtype="float16",
+            quantize_4bit=True
+        )
+    return _model
 
 
 # ----------------------------
@@ -87,6 +87,7 @@ def run_inference(
 
         start = time.time()
         with torch.inference_mode():
+            model = get_model()
             output_audio_np = model.generate(
                 text_input,
                 max_tokens=max_new_tokens,
@@ -130,6 +131,13 @@ def run_inference(
             except Exception as e:
                 print(f"[WARN] Failed to delete temp file: {e}")
 
+        # 🔥 Best VRAM cleanup fix
+        import gc
+        del output_audio_np  # Ensure output is released
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
     return output_audio
 
 
@@ -168,6 +176,7 @@ with gr.Blocks(css=css) as demo:
                 type="numpy",
             )
             with gr.Accordion("Generation Parameters", open=False):
+                model = get_model()
                 max_new_tokens = gr.Slider(
                     label="Max New Tokens",
                     minimum=860,

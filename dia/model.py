@@ -1,5 +1,5 @@
 from enum import Enum
-
+import inspect
 import dac
 import numpy as np
 import torch
@@ -424,6 +424,12 @@ class Dia:
         logger.info("Starting generation for text prompt")
         total_start = time.time()
 
+        # Log parameters
+        frame = inspect.currentframe()
+        args, _, _, values = inspect.getargvalues(frame)
+        param_log = ", ".join(f"{arg}={values[arg]!r}" for arg in args if arg != "self")
+        logger.info(f"generate() called with: {param_log}")
+
         # Fast handling of deprecated args
         if audio_prompt_path:
             logger.warning("audio_prompt_path is deprecated. Use audio_prompt instead.")
@@ -510,6 +516,13 @@ class Dia:
         logger.info(f"Decoding to audio took: {time.time() - decode_start:.3f}s")
 
         logger.info(f"End-to-end generation time: {time.time() - total_start:.3f}s")
+
+        num_generated_steps = dec_step - dec_output.prefill_step + 1
+        logger.info(
+            f"[GEN-STATS] max_tokens={max_tokens}, steps_generated={num_generated_steps}, "
+            f"eos_detected={eos_detected}, final_dec_step={dec_step}"
+        )
+
         return audio
 
 
