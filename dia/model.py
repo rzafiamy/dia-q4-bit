@@ -1,4 +1,3 @@
-import time
 from enum import Enum
 
 import dac
@@ -11,6 +10,12 @@ from .audio import apply_audio_delay, build_delay_indices, build_revert_indices,
 from .config import DiaConfig
 from .layers import DiaModel
 from .state import DecoderInferenceState, DecoderOutput, EncoderInferenceState
+
+import time
+import logging
+
+logger = logging.getLogger("Dia")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 DEFAULT_SAMPLE_RATE = 44100
@@ -416,53 +421,58 @@ class Dia:
         use_cfg_filter: bool | None = None,
         verbose: bool = False,
     ) -> np.ndarray:
-        audio_eos_value = self.config.data.audio_eos_value
-        audio_pad_value = self.config.data.audio_pad_value
-        delay_pattern = self.config.data.delay_pattern
-        max_tokens = self.config.data.audio_length if max_tokens is None else max_tokens
-        max_delay_pattern = max(delay_pattern)
-        self.model.eval()
+        logger.info("Starting generation for text prompt")
+        total_start = time.time()
 
+        # Fast handling of deprecated args
         if audio_prompt_path:
-            print("Warning: audio_prompt_path is deprecated. Use audio_prompt instead.")
+            logger.warning("audio_prompt_path is deprecated. Use audio_prompt instead.")
             audio_prompt = audio_prompt_path
-        if use_cfg_filter is not None:
-            print("Warning: use_cfg_filter is deprecated.")
 
-        if verbose:
-            total_start_time = time.time()
+        # Constants and config
+        model = self.model
+        model.eval()
+        cfg = self.config.data
+        max_tokens = cfg.audio_length if max_tokens is None else max_tokens
+        max_delay_pattern = max(cfg.delay_pattern)
 
+        # Preparation phase
+        prep_start = time.time()
         dec_state, dec_output = self._prepare_generation(text, audio_prompt, verbose)
+        logger.info(f"Preparation time: {time.time() - prep_start:.3f}s")
+
+        # Decoder function
+        step_fn = (
+            torch.compile(self._decoder_step, mode="default", dynamic=True)
+            if use_torch_compile else self._decoder_step
+        )
+
         dec_step = dec_output.prefill_step - 1
-
         bos_countdown = max_delay_pattern
-        eos_detected = False
-        eos_countdown = -1
+        eos_detected, eos_countdown = False, -1
 
-        if use_torch_compile:
-            step_fn = torch.compile(self._decoder_step, mode="default")
-        else:
-            step_fn = self._decoder_step
+        logger.info(f"Begin generation loop at step {dec_step}")
+        log_interval = 50
+        gen_start = time.time()
 
-        if verbose:
-            print("generate: starting generation loop")
-            if use_torch_compile:
-                print("generate: by using use_torch_compile=True, the first step would take long")
-            start_time = time.time()
+        # Cache tensors/constants
+        delay_pattern = cfg.delay_pattern
+        audio_eos_value = cfg.audio_eos_value
+        audio_pad_value = cfg.audio_pad_value
 
         while dec_step < max_tokens:
-            dec_state.prepare_step(dec_step)
-            tokens_Bx1xC = dec_output.get_tokens_at(dec_step).unsqueeze(0).expand(2, -1, -1)
-            pred_C = step_fn(
-                tokens_Bx1xC,
-                dec_state,
-                cfg_scale,
-                temperature,
-                top_p,
-                cfg_filter_top_k,
-            )
+            loop_start = time.time()
 
-            if (not eos_detected and pred_C[0] == audio_eos_value) or dec_step == max_tokens - max_delay_pattern - 1:
+            # Prepare model for current step
+            dec_state.prepare_step(dec_step)
+
+            tokens = dec_output.get_tokens_at(dec_step).unsqueeze(0).expand(2, -1, -1)
+
+            # Decoder step
+            pred = step_fn(tokens, dec_state, cfg_scale, temperature, top_p, cfg_filter_top_k)
+
+            # EOS logic (manual scheduling)
+            if (not eos_detected and pred[0] == audio_eos_value) or dec_step == max_tokens - max_delay_pattern - 1:
                 eos_detected = True
                 eos_countdown = max_delay_pattern
 
@@ -470,34 +480,36 @@ class Dia:
                 step_after_eos = max_delay_pattern - eos_countdown
                 for i, d in enumerate(delay_pattern):
                     if step_after_eos == d:
-                        pred_C[i] = audio_eos_value
+                        pred[i] = audio_eos_value
                     elif step_after_eos > d:
-                        pred_C[i] = audio_pad_value
+                        pred[i] = audio_pad_value
                 eos_countdown -= 1
 
+            # Update
             bos_countdown = max(0, bos_countdown - 1)
-            dec_output.update_one(pred_C, dec_step + 1, bos_countdown > 0)
+            dec_output.update_one(pred, dec_step + 1, bos_countdown > 0)
+            dec_step += 1
+
+            if dec_step % log_interval == 0:
+                elapsed = time.time() - loop_start
+                logger.info(
+                    f"Step {dec_step}: {log_interval / elapsed:.2f} tok/s; "
+                    f"total gen={time.time() - gen_start:.3f}s"
+                )
 
             if eos_countdown == 0:
+                logger.info("EOS completed, exiting generation loop")
                 break
 
-            dec_step += 1
-            if verbose and dec_step % 86 == 0:
-                duration = time.time() - start_time
-                print(
-                    f"generate step {dec_step}: speed={86 / duration:.3f} tokens/s, realtime factor={1 / duration:.3f}x"
-                )
-                start_time = time.time()
+        logger.info(f"Total generation time: {time.time() - gen_start:.3f}s over {dec_step} steps")
 
-        if dec_output.prefill_step >= dec_step + 1:
-            print("Warning: Nothing generated")
-            return None
+        # Final decoding to audio
+        decode_start = time.time()
+        codes = dec_output.generated_tokens[dec_output.prefill_step : dec_step + 1, :]
+        audio = self._generate_output(codes)
+        logger.info(f"Decoding to audio took: {time.time() - decode_start:.3f}s")
 
-        generated_codes = dec_output.generated_tokens[dec_output.prefill_step : dec_step + 1, :]
+        logger.info(f"End-to-end generation time: {time.time() - total_start:.3f}s")
+        return audio
 
-        if verbose:
-            total_step = dec_step + 1 - dec_output.prefill_step
-            total_duration = time.time() - total_start_time
-            print(f"generate: total step={total_step}, total duration={total_duration:.3f}s")
 
-        return self._generate_output(generated_codes)

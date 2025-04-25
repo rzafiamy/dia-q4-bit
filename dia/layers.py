@@ -7,6 +7,13 @@ from torch.nn import RMSNorm
 from .config import DiaConfig
 from .state import DecoderInferenceState, EncoderInferenceState, KVCache
 
+try:
+    from flash_attn import flash_attn_func
+    _flash_attn_available = True
+except ImportError:
+    _flash_attn_available = False
+
+
 
 def _normalize_axes(axes: tuple[int, ...], ndim: int) -> tuple[int, ...]:
     return tuple(ax if ax >= 0 else ndim + ax for ax in axes)
@@ -138,7 +145,7 @@ class RotaryEmbedding(nn.Module):
 
 
 class Attention(nn.Module):
-    """Attention using DenseGeneral."""
+    """Attention using DenseGeneral with optional FlashAttention2."""
 
     def __init__(
         self,
@@ -163,7 +170,6 @@ class Attention(nn.Module):
             raise ValueError(f"num_query_heads ({num_query_heads}) must be divisible by num_kv_heads ({num_kv_heads})")
         self.num_gqa_groups = num_query_heads // num_kv_heads
 
-        # --- Projection Layers using DenseGeneral ---
         self.q_proj = DenseGeneral(
             in_shapes=(q_embed_dim,),
             out_features=(num_query_heads, head_dim),
@@ -189,7 +195,6 @@ class Attention(nn.Module):
             weight_dtype=compute_dtype,
         )
 
-        # --- Rotary Embedding ---
         self.rotary_emb = RotaryEmbedding(
             embedding_dims=self.head_dim,
             min_timescale=config.model.rope_min_timescale,
@@ -199,36 +204,21 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        Xq: torch.Tensor,  # (B, T, D) T = 1 in AR generation
-        Xkv: torch.Tensor,  # (B, S, E) S = 1 in AR generation
+        Xq: torch.Tensor,  # (B, T, D)
+        Xkv: torch.Tensor,  # (B, S, E)
         q_positions: torch.Tensor,  # (B, T)
-        kv_positions: torch.Tensor | None = None,  # (B, S)
-        attn_mask: torch.Tensor | None = None,  # None in Decoder Self Attention, Valid mask in Others
-        cache: KVCache | None = None,  # None in Encoder, KVCache in Decoder
+        kv_positions: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+        cache: KVCache | None = None,
         prefill: bool = False,
         is_causal: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-        """
-        Performs attention calculation with optional KV caching.
-
-        Args:
-            Xq: Query tensor (B, T, D). T=1 during single-step decoding.
-            Xkv: Key/Value source tensor (B, S, E). S=1 during single-step decoding for self-attn.
-            q_positions: Positions for queries (B, T).
-            kv_positions: Positions for keys/values (B, S). If None, uses q_positions.
-            attn_mask: Attention mask.
-            cache: KVCache.
-            prefill: If True, use prefill mode.
-
-        Returns:
-            A tuple containing:
-            - output: The attention output tensor (B, T, output_dim).
-            - present_kv: The K/V state to be cached for the next step ((B, N, S_new, H), (B, N, S_new, H)). For self-attn, S_new = S_past + S. For cross-attn, S_new = S_kv.
-        """
         if kv_positions is None:
             kv_positions = q_positions
+
         original_dtype = Xq.dtype
 
+        # Query projection and RoPE
         Xq_BxTxNxH = self.q_proj(Xq)
         Xq_BxTxNxH = self.rotary_emb(Xq_BxTxNxH, position=q_positions)
         Xq_BxNxTxH = Xq_BxTxNxH.transpose(1, 2)
@@ -239,12 +229,12 @@ class Attention(nn.Module):
         if self.is_cross_attn:
             attn_k, attn_v = cache.k, cache.v
         else:
-            Xk_BxSxKxH = self.k_proj(Xkv)  # (B, S, K, H)
-            Xv_BxSxKxH = self.v_proj(Xkv)  # (B, S, K, H)
-            Xk_BxSxKxH = self.rotary_emb(Xk_BxSxKxH, position=kv_positions)  # (B, S, K, H)
+            Xk_BxSxKxH = self.k_proj(Xkv)
+            Xv_BxSxKxH = self.v_proj(Xkv)
+            Xk_BxSxKxH = self.rotary_emb(Xk_BxSxKxH, position=kv_positions)
 
-            Xk_BxKxSxH = Xk_BxSxKxH.transpose(1, 2)  # (B, K, S, H)
-            Xv_BxKxSxH = Xv_BxSxKxH.transpose(1, 2)  # (B, K, S, H)
+            Xk_BxKxSxH = Xk_BxSxKxH.transpose(1, 2)
+            Xv_BxKxSxH = Xv_BxSxKxH.transpose(1, 2)
 
             if cache is None:
                 attn_k = Xk_BxKxSxH
@@ -256,15 +246,46 @@ class Attention(nn.Module):
                 else:
                     attn_k, attn_v = cache.update(Xk_BxKxSxH, Xv_BxKxSxH)
 
-        attn_output = F.scaled_dot_product_attention(
-            Xq_BxNxTxH,
-            attn_k,
-            attn_v,
-            attn_mask=attn_mask,
-            scale=1.0,
-            enable_gqa=self.num_gqa_groups > 1,
-            is_causal=is_causal,
+        # --- FlashAttention2 Path ---
+        use_flash = (
+            _flash_attn_available and
+            attn_mask is None and
+            not self.is_cross_attn and
+            not prefill  # FlashAttn currently not ideal for batch prefill with large KV
         )
+
+        if use_flash:
+            # FlashAttn expects shape: (B, T, H) with merged heads
+            q = Xq_BxNxTxH.transpose(1, 2).contiguous()
+            k = attn_k.transpose(1, 2).contiguous()
+            v = attn_v.transpose(1, 2).contiguous()
+
+            B, T, N, H = q.shape
+            q = q.reshape(B, T, N * H)
+            k = k.reshape(B, T, N * H)
+            v = v.reshape(B, T, N * H)
+
+            out = flash_attn_func(
+                q, k, v,
+                dropout_p=0.0,
+                softmax_scale=None,
+                causal=is_causal,
+                return_attn_probs=False,
+            )  # (B, T, N*H)
+
+            out = out.view(B, T, N, H)
+            attn_output = out.transpose(1, 2).contiguous()  # (B, N, T, H)
+        else:
+            # Default PyTorch Attention
+            attn_output = F.scaled_dot_product_attention(
+                Xq_BxNxTxH,
+                attn_k,
+                attn_v,
+                attn_mask=attn_mask,
+                scale=1.0,
+                enable_gqa=self.num_gqa_groups > 1,
+                is_causal=is_causal,
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous()  # (B, T, N, H)
         output = self.o_proj(attn_output)

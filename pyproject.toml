@@ -22,6 +22,9 @@ dependencies = [
     "triton-windows>=3.2.0.post18 ; sys_platform == 'win32'",
 ]
 
+[project.optional-dependencies]
+flash = ["flash-attn"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -34,12 +37,10 @@ build-backend = "hatchling.build"
 packages = ["dia"]
 
 [tool.ruff]
-# Never enforce `E501` (line length violations).
 lint.ignore = ["C901", "E501", "E741", "W605"]
 lint.select = ["C", "E", "F", "I", "W"]
 line-length = 119
 
-# Ignore import violations in all `__init__.py` files.
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403", "F811"]
 
