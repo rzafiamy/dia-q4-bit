@@ -75,6 +75,9 @@ class ComputeDtype(str, Enum):
         else:
             raise ValueError(f"Unsupported compute dtype: {self}")
 
+from bitsandbytes.nn import Linear4bit
+import traceback
+import torch.nn as nn
 
 class Dia:
     def __init__(
@@ -108,66 +111,119 @@ class Dia:
         checkpoint_path: str,
         compute_dtype: str | ComputeDtype = ComputeDtype.FLOAT32,
         device: torch.device | None = None,
+        quantize: bool = False,
+        quantize_4bit: bool = False,
     ) -> "Dia":
-        """Loads the Dia model from local configuration and checkpoint files.
-
-        Args:
-            config_path: Path to the configuration JSON file.
-            checkpoint_path: Path to the model checkpoint (.pth) file.
-            device: The device to load the model onto. If None, will automatically select the best available device.
-
-        Returns:
-            An instance of the Dia model loaded with weights and set to eval mode.
-
-        Raises:
-            FileNotFoundError: If the config or checkpoint file is not found.
-            RuntimeError: If there is an error loading the checkpoint.
-        """
+        print(f"[Dia] Loading config from: {config_path}")
         config = DiaConfig.load(config_path)
         if config is None:
             raise FileNotFoundError(f"Config file not found at {config_path}")
 
-        dia = cls(config, compute_dtype, device)
+        print(f"[Dia] Instantiating Dia model on CPU with dtype={compute_dtype}")
+        # Force CPU at init time to avoid CUDA OOM
+        dia = cls(config, compute_dtype, device=torch.device("cpu"))
 
+        print(f"[Dia] Loading checkpoint from: {checkpoint_path}")
         try:
-            state_dict = torch.load(checkpoint_path, map_location=dia.device)
+            # Load weights on CPU first
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            print("[Dia] Checkpoint successfully loaded.")
             dia.model.load_state_dict(state_dict)
+            print("[Dia] Weights successfully loaded into model.")
         except FileNotFoundError:
             raise FileNotFoundError(f"Checkpoint file not found at {checkpoint_path}")
         except Exception as e:
+            print("[Dia] Exception during model load:")
+            traceback.print_exc()
             raise RuntimeError(f"Error loading checkpoint from {checkpoint_path}") from e
 
-        dia.model.to(dia.device)
         dia.model.eval()
+
+        print(f"[Dia] Quantization flags -> INT8: {quantize}, 4bit: {quantize_4bit}")
+        if quantize:
+            dia.quantize_model()
+        if quantize_4bit:
+            print("[Dia] Applying 4-bit quantization...")
+            dia.quantize_model_4bit()
+
+        # Move the quantized model to GPU only after quantization
+        final_device = device if device is not None else _get_default_device()
+        print(f"[Dia] Moving model to: {final_device}")
+        dia.device = final_device
+        dia.model.to(dia.device)
+
+        print("[Dia] Loading DAC model...")
         dia._load_dac_model()
+        print("[Dia] Model fully initialized ✅")
+
         return dia
 
+
+
+    def quantize_model(self):
+        """Apply dynamic INT8 quantization to encoder and decoder."""
+        print("Quantizing DiaModel encoder and decoder (INT8)...")
+        self.model.encoder = torch.quantization.quantize_dynamic(
+            self.model.encoder, {nn.Linear}, dtype=torch.qint8
+        )
+        self.model.decoder = torch.quantization.quantize_dynamic(
+            self.model.decoder, {nn.Linear}, dtype=torch.qint8
+        )
+
+    def quantize_model_4bit(self):
+        """Replace nn.Linear layers with properly initialized bnb.nn.Linear4bit layers."""
+
+        def replace_linear(module):
+            for name, child in module.named_children():
+                if isinstance(child, nn.Linear):
+                    print(f"Converting {name} to Linear4bit")
+
+                    new_linear = bnb.nn.Linear4bit(
+                        in_features=child.in_features,
+                        out_features=child.out_features,
+                        bias=child.bias is not None,
+                        compute_dtype=torch.float16,
+                        quant_type="nf4",  # or "fp4", "int4" if you want to test
+                        compress_statistics=True,
+                    )
+
+                    # Load the pretrained FP32 weights into the 4-bit wrapper
+                    new_linear.weight = nn.Parameter(child.weight.detach().clone())
+                    if child.bias is not None:
+                        new_linear.bias = nn.Parameter(child.bias.detach().clone())
+
+                    setattr(module, name, new_linear)
+
+                else:
+                    replace_linear(child)
+
+        print("Quantizing DiaModel encoder and decoder (4-bit, manual conversion)...")
+        replace_linear(self.model.encoder)
+        replace_linear(self.model.decoder)
+
+        
     @classmethod
     def from_pretrained(
         cls,
         model_name: str = "nari-labs/Dia-1.6B",
         compute_dtype: str | ComputeDtype = ComputeDtype.FLOAT32,
         device: torch.device | None = None,
+        quantize: bool = False,         # INT8
+        quantize_4bit: bool = False,    # INT4 (bnb)
     ) -> "Dia":
-        """Loads the Dia model from a Hugging Face Hub repository.
-
-        Downloads the configuration and checkpoint files from the specified
-        repository ID and then loads the model.
-
-        Args:
-            model_name: The Hugging Face Hub repository ID (e.g., "NariLabs/Dia-1.6B").
-            device: The device to load the model onto. If None, will automatically select the best available device.
-
-        Returns:
-            An instance of the Dia model loaded with weights and set to eval mode.
-
-        Raises:
-            FileNotFoundError: If config or checkpoint download/loading fails.
-            RuntimeError: If there is an error loading the checkpoint.
-        """
         config_path = hf_hub_download(repo_id=model_name, filename="config.json")
         checkpoint_path = hf_hub_download(repo_id=model_name, filename="dia-v0_1.pth")
-        return cls.from_local(config_path, checkpoint_path, compute_dtype, device)
+        print(f"[Dia] quantize={quantize}, quantize_4bit={quantize_4bit}")
+        return cls.from_local(
+            config_path,
+            checkpoint_path,
+            compute_dtype,
+            device,
+            quantize=quantize,
+            quantize_4bit=quantize_4bit,  # << pass it through
+        )
+
+
 
     def _load_dac_model(self):
         try:

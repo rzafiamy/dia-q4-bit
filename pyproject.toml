@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.11.3",
     "soundfile>=0.13.1",
     "torch>=2.6.0",
+    "bitsandbytes",
     "torchaudio>=2.6.0",
     "triton>=3.2.0 ; sys_platform == 'linux'",
     "triton-windows>=3.2.0.post18 ; sys_platform == 'win32'",

@@ -19,3 +19,5 @@ wheels/
 .ruff_cache
 .ipynb_checkpoints
 config.json
+
+*.lock
