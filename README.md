@@ -100,13 +100,33 @@ python app.py
 ```python
 from dia.model import Dia
 
-model = Dia.from_pretrained("nari-labs/Dia-1.6B", compute_dtype="float16")
+def get_model(quantize=False, quantize_4bit=False):
+    print("[INFO] Loading Dia model...")
+    return Dia.from_pretrained(
+        "nari-labs/Dia-1.6B",
+        compute_dtype="float16",
+        quantize=quantize,
+        quantize_4bit=quantize_4bit
+    )
 
-text = "[S1] Dia is an open weights text to dialogue model. [S2] You get full control over scripts and voices. [S1] Wow. Amazing. (laughs) [S2] Try it now on GitHub or Hugging Face."
+model = get_model(quantize_4bit=True)  # or quantize=True for int8
+
+text = "[S1] Dia is fast and memory-efficient! [S2] And it sounds great. (laughs)"
 
 output = model.generate(text, use_torch_compile=True, verbose=True)
 model.save_audio("simple.mp3", output)
+
 ```
+
+---
+
+### 🔧 Notes on Quantization
+
+- `quantize=True`: Use **INT8 quantization**  
+- `quantize_4bit=True`: Use **4-bit quantization**  
+- Both reduce VRAM usage significantly (under 6 GB), perfect for 8 GB consumer GPUs.
+- Only one of these options should be enabled at a time.
+
 
 > 📢 CLI and PyPI package coming soon.
 
