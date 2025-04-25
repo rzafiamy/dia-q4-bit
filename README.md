@@ -69,13 +69,13 @@ This is a **community-enhanced fork** of the original [nari-labs/dia](https://gi
 ### 1. Install via pip (from this fork)
 
 ```bash
-pip install git+https://github.com/<your-username>/dia.git
+pip install git+https://github.com/rzafiamy/dia.git
 ```
 
 ### 2. Launch the Gradio UI
 
 ```bash
-git clone https://github.com/<your-username>/dia.git
+git clone https://github.com/rzafiamy/dia.git
 cd dia
 uv run app.py
 ```
@@ -83,7 +83,7 @@ uv run app.py
 Or using a Python virtual environment:
 
 ```bash
-git clone https://github.com/<your-username>/dia.git
+git clone https://github.com/rzafiamy/dia.git
 cd dia
 python -m venv .venv
 source .venv/bin/activate
