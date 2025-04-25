@@ -27,7 +27,7 @@
 
 ---
 
-# 🎙️ Dia - Text to Speech Dialogue Model
+# 🎙️ Dia Q4 BIT- Text to Speech Dialogue Model
 
 Dia is a 1.6B parameter text-to-speech model developed by **Nari Labs**, designed to **generate highly realistic dialogues directly from transcripts**. It supports emotional conditioning and non-verbal cues such as laughter, coughing, and more.
 
@@ -69,13 +69,13 @@ This is a **community-enhanced fork** of the original [nari-labs/dia](https://gi
 ### 1. Install via pip (from this fork)
 
 ```bash
-pip install git+https://github.com/rzafiamy/dia.git
+pip install git+https://github.com/rzafiamy/dia-q4-bit.git
 ```
 
 ### 2. Launch the Gradio UI
 
 ```bash
-git clone https://github.com/rzafiamy/dia.git
+git clone https://github.com/rzafiamy/dia-q4-bit.git
 cd dia
 uv run app.py
 ```
@@ -83,7 +83,7 @@ uv run app.py
 Or using a Python virtual environment:
 
 ```bash
-git clone https://github.com/rzafiamy/dia.git
+git clone https://github.com/rzafiamy/dia-q4-bit.git
 cd dia
 python -m venv .venv
 source .venv/bin/activate
